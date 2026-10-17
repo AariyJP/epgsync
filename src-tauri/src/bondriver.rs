@@ -17,8 +17,16 @@ fn relays(cfg: &Config) -> impl Iterator<Item = &Peer> {
     cfg.peers.iter().filter(|p| !p.bdp_url.trim().is_empty())
 }
 
+fn module_file(name: &str) -> String {
+    format!("BonDriver_Proxy_{name}.{EXT}")
+}
+
 fn module_path(cfg: &Config, name: &str) -> PathBuf {
-    Path::new(&cfg.bondriver_dir).join(format!("BonDriver_Proxy_{name}.{EXT}"))
+    Path::new(&cfg.bondriver_dir).join(module_file(name))
+}
+
+fn utf16le(s: &str) -> Vec<u8> {
+    std::iter::once(0xFEFFu16).chain(s.encode_utf16()).flat_map(u16::to_le_bytes).collect()
 }
 
 fn setting_path(module: &Path) -> PathBuf {
@@ -29,11 +37,23 @@ fn setting_path(module: &Path) -> PathBuf {
     }
 }
 
-fn set_keys(text: &[u8], keys: &[(&str, String)]) -> Vec<u8> {
+fn split_lines(text: &[u8]) -> Vec<Vec<u8>> {
     let mut lines: Vec<Vec<u8>> = text.split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l).to_vec()).collect();
     if lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop();
     }
+    lines
+}
+
+fn join_lines(lines: &[Vec<u8>]) -> Vec<u8> {
+    let eol: &[u8] = if cfg!(windows) { b"\r\n" } else { b"\n" };
+    let mut out = lines.join(eol);
+    out.extend_from_slice(eol);
+    out
+}
+
+fn set_keys(text: &[u8], keys: &[(&str, String)]) -> Vec<u8> {
+    let mut lines = split_lines(text);
     for (key, value) in keys {
         let entry = format!("{key}={value}").into_bytes();
         let prefix = format!("{key}=").into_bytes();
@@ -45,10 +65,7 @@ fn set_keys(text: &[u8], keys: &[(&str, String)]) -> Vec<u8> {
             lines.push(entry);
         }
     }
-    let eol: &[u8] = if cfg!(windows) { b"\r\n" } else { b"\n" };
-    let mut out = lines.join(eol);
-    out.extend_from_slice(eol);
-    out
+    join_lines(&lines)
 }
 
 fn write_module(cfg: &Config, peer: &Peer) -> Result<String, String> {
@@ -73,6 +90,126 @@ fn write_module(cfg: &Config, peer: &Peer) -> Result<String, String> {
     );
     fs::write(&setting, text).map_err(|e| err(&setting, e))?;
     Ok(format!("{} / {}", module.display(), setting.display()))
+}
+
+fn edcb_ini(cfg: &Config) -> PathBuf {
+    let ini = cfg.edcb_ini.trim();
+    if !ini.is_empty() {
+        PathBuf::from(ini)
+    } else if cfg!(windows) {
+        Path::new(&cfg.bondriver_dir).parent().unwrap_or(Path::new("")).join("EpgTimerSrv.ini")
+    } else {
+        PathBuf::from("/var/local/edcb/EpgTimerSrv.ini")
+    }
+}
+
+fn num(v: &[u8]) -> Option<i64> {
+    std::str::from_utf8(v).ok()?.trim().parse().ok()
+}
+
+fn section_range(lines: &[Vec<u8>], head: &[u8]) -> Option<(usize, usize)> {
+    let start = lines.iter().position(|l| l.trim_ascii().eq_ignore_ascii_case(head))? + 1;
+    let end = lines[start..].iter().position(|l| l.trim_ascii().starts_with(b"[")).map_or(lines.len(), |i| start + i);
+    Some((start, end))
+}
+
+fn indexed(line: &[u8]) -> Option<(i64, &[u8])> {
+    let t = line.trim_ascii();
+    let p = t.iter().position(|&b| b == b'=')?;
+    Some((num(&t[..p])?, t[p + 1..].trim_ascii()))
+}
+
+fn set_tuner(lines: &mut Vec<Vec<u8>>, file: &str, want: Option<u16>) -> bool {
+    let on = want.is_some();
+    let section = format!("[{file}]");
+    let mut changed = false;
+    match section_range(lines, section.as_bytes()) {
+        None if on => {
+            let mut bondriver = false;
+            let mut priority = -1;
+            for line in lines.iter().map(|l| l.trim_ascii()) {
+                if line.starts_with(b"[") {
+                    bondriver = line.len() > 10 && line[1..10].eq_ignore_ascii_case(b"BonDriver");
+                } else if bondriver && let Some(v) = line.strip_prefix(b"Priority=") {
+                    priority = priority.max(num(v).unwrap_or(-1));
+                }
+            }
+            let entry = [String::new(), section, format!("Count={}", want.unwrap_or(0).max(1)), "GetEpg=0".into(), "EPGCount=0".into(), format!("Priority={}", priority + 1)];
+            lines.extend(entry.map(String::into_bytes));
+            changed = true;
+        }
+        Some((s, e)) => {
+            let at = (s..e).find_map(|i| lines[i].trim_ascii().strip_prefix(b"Count=").map(|v| (i, num(v))));
+            let count = at.and_then(|(_, n)| n).unwrap_or(0);
+            let target = match want {
+                None => 0,
+                Some(0) => count.max(1),
+                Some(n) => n.into(),
+            };
+            if count != target {
+                let entry = format!("Count={target}").into_bytes();
+                match at {
+                    Some((i, _)) => lines[i] = entry,
+                    None => lines.insert(s, entry),
+                }
+                changed = true;
+            }
+        }
+        None => {}
+    }
+    let viewer = match section_range(lines, b"[TVTEST]") {
+        None if on => {
+            lines.push(b"[TVTEST]".to_vec());
+            Some((lines.len(), lines.len()))
+        }
+        r => r,
+    };
+    if let Some((s, e)) = viewer {
+        let mut keyed: Vec<(i64, &[u8])> = lines[s..e].iter().filter_map(|l| indexed(l)).collect();
+        keyed.sort_by_key(|v| v.0);
+        let mut values: Vec<Vec<u8>> = keyed.into_iter().map(|(_, v)| v.to_vec()).collect();
+        let listed = values.iter().any(|v| v.eq_ignore_ascii_case(file.as_bytes()));
+        if listed != on {
+            if on {
+                values.push(file.as_bytes().to_vec());
+            } else {
+                values.retain(|v| !v.eq_ignore_ascii_case(file.as_bytes()));
+            }
+            let rest: Vec<Vec<u8>> = lines.drain(s..e).filter(|l| !l.trim_ascii().starts_with(b"Num=") && indexed(l).is_none()).collect();
+            let mut body = vec![format!("Num={}", values.len()).into_bytes()];
+            body.extend(values.into_iter().enumerate().map(|(i, v)| [format!("{i}=").into_bytes(), v].concat()));
+            body.extend(rest);
+            lines.splice(s..s, body);
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn update_tuners(cfg: &Config, changes: &[(String, Option<u16>)]) -> Result<Vec<(String, bool)>, String> {
+    if changes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ini = edcb_ini(cfg);
+    let raw = fs::read(&ini).map_err(|e| format!("{}: {e}", ini.display()))?;
+    let utf16 = raw.starts_with(&[0xFF, 0xFE]);
+    let text = if utf16 {
+        String::from_utf16_lossy(&raw[2..].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>()).into_bytes()
+    } else {
+        raw
+    };
+    let mut lines = split_lines(&text);
+    let mut done = Vec::new();
+    for (name, want) in changes {
+        if set_tuner(&mut lines, &module_file(name), *want) {
+            done.push((name.clone(), want.is_some()));
+        }
+    }
+    if !done.is_empty() {
+        let out = join_lines(&lines);
+        sync::write_atomic(&ini, if utf16 { utf16le(&String::from_utf8_lossy(&out)) } else { out })?;
+    }
+    Ok(done)
 }
 
 fn run(cmd: &str, args: &[&str]) -> Result<(), String> {
@@ -114,8 +251,7 @@ fn register(name: &str) -> Result<(), String> {
         esc(&args)
     );
     let file = std::env::temp_dir().join(format!("epgsync-relay-{name}.xml"));
-    let bytes: Vec<u8> = std::iter::once(0xFEFFu16).chain(xml.encode_utf16()).flat_map(u16::to_le_bytes).collect();
-    fs::write(&file, bytes).map_err(|e| e.to_string())?;
+    fs::write(&file, utf16le(&xml)).map_err(|e| e.to_string())?;
     let task = format!("{TASK_PREFIX}{name}");
     let result = run("schtasks", &["/Create", "/TN", &task, "/XML", &file.display().to_string(), "/F"]);
     let _ = fs::remove_file(&file);
@@ -186,6 +322,8 @@ pub fn apply(cfg: &Config) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let mut ports = Vec::new();
     let same = |a: &str, b: &str| if cfg!(windows) { a.eq_ignore_ascii_case(b) } else { a == b };
+    let existing = registered();
+    let mut tuners: Vec<(String, Option<u16>)> = Vec::new();
     for peer in relays(cfg) {
         let name = peer.bdp_name.trim();
         if !valid_name(name) || peer.bdp_port == 0 || peer.bdp_group.trim().is_empty() {
@@ -205,16 +343,26 @@ pub fn apply(cfg: &Config) -> Vec<String> {
                 continue;
             }
         }
+        if peer.bdp_count > 0 || !existing.iter().any(|s| same(name, s)) {
+            tuners.push((name.to_string(), Some(peer.bdp_count)));
+        }
         match register(name) {
             Ok(()) => log.push(format!("{name}: 中継を登録しました (127.0.0.1:{} → {})", peer.bdp_port, peer.bdp_url)),
             Err(e) => log.push(format!("{name}: 中継の登録に失敗しました: {e}")),
         }
     }
-    for stale in registered().into_iter().filter(|s| !names.iter().any(|n| same(n, s))) {
+    for stale in existing.into_iter().filter(|s| !names.iter().any(|n| same(n, s))) {
         match unregister(&stale) {
             Ok(()) => log.push(format!("{stale}: 中継の登録を外しました")),
             Err(e) => log.push(format!("{stale}: 中継の削除に失敗しました: {e}")),
         }
+        tuners.push((stale, None));
+    }
+    match update_tuners(cfg, &tuners) {
+        Ok(done) => log.extend(done.into_iter().map(|(name, on)| {
+            format!("{name}: EpgTimerSrv.ini のチューナー・視聴用の登録を{}しました (EpgTimer Service の再起動後に反映されます)", if on { "追加" } else { "解除" })
+        })),
+        Err(e) => log.push(format!("EpgTimerSrv.ini の更新に失敗しました: {e}")),
     }
     if log.is_empty() {
         log.push("BonDriver の設定がある取得先はありません".into());
@@ -222,21 +370,22 @@ pub fn apply(cfg: &Config) -> Vec<String> {
     log
 }
 
+fn relay_once(name: &str) -> Result<std::process::ExitStatus, String> {
+    let cfg = sync::load()?;
+    let peer = relays(&cfg).find(|p| p.bdp_name.trim() == name).ok_or(format!("{name}: not configured"))?;
+    let (id, secret) = sync::read_token(&peer.token_file).map_err(|e| format!("{name}: {}: {e}", peer.token_file))?;
+    Command::new(&cfg.cloudflared)
+        .args(["access", "tcp", "--hostname", peer.bdp_url.trim(), "--url", &format!("127.0.0.1:{}", peer.bdp_port), "--loglevel", "warn"])
+        .env("TUNNEL_SERVICE_TOKEN_ID", id)
+        .env("TUNNEL_SERVICE_TOKEN_SECRET", secret)
+        .status()
+        .map_err(|e| format!("{name}: {}: {e}", cfg.cloudflared))
+}
+
 pub fn relay(name: &str) -> Result<(), String> {
     loop {
-        let found = sync::load().and_then(|cfg| {
-            let peer = relays(&cfg).find(|p| p.bdp_name.trim() == name).cloned().ok_or(format!("{name}: not configured"))?;
-            Ok((cfg, peer))
-        });
-        match found.and_then(|(cfg, peer)| Ok((sync::read_token(&peer.token_file).map_err(|e| format!("{name}: {}: {e}", peer.token_file))?, cfg, peer))) {
-            Ok(((id, secret), cfg, peer)) => {
-                let status = Command::new(&cfg.cloudflared)
-                    .args(["access", "tcp", "--hostname", peer.bdp_url.trim(), "--url", &format!("127.0.0.1:{}", peer.bdp_port), "--loglevel", "warn"])
-                    .env("TUNNEL_SERVICE_TOKEN_ID", id)
-                    .env("TUNNEL_SERVICE_TOKEN_SECRET", secret)
-                    .status();
-                eprintln!("{name}: cloudflared exited: {status:?}");
-            }
+        match relay_once(name) {
+            Ok(status) => eprintln!("{name}: cloudflared exited: {status}"),
             Err(e) => eprintln!("{e}"),
         }
         std::thread::sleep(Duration::from_secs(10));

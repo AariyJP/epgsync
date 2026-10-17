@@ -9,7 +9,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 
-type Peer = { url: string; token_file: string; bdp_url: string; bdp_port: number; bdp_group: string; bdp_name: string };
+type Peer = { url: string; token_file: string; bdp_url: string; bdp_port: number; bdp_group: string; bdp_name: string; bdp_count: number };
 type Config = {
   epg_dir: string;
   listen: string;
@@ -19,6 +19,7 @@ type Config = {
   reload_addr: string;
   bondriver_dir: string;
   cloudflared: string;
+  edcb_ini: string;
 };
 
 function Field({ id, label, value, onChange, placeholder }: { id: string; label: string; value: string; onChange: (v: string) => void; placeholder?: string }) {
@@ -29,6 +30,12 @@ function Field({ id, label, value, onChange, placeholder }: { id: string; label:
     </div>
   );
 }
+
+function LogView({ lines }: { lines?: string[] }) {
+  return lines?.length ? <pre className="rounded-md bg-muted p-3 text-xs whitespace-pre-wrap">{lines.join("\n")}</pre> : null;
+}
+
+type Cmd = "run_pull" | "apply_bondriver";
 
 type Theme = "light" | "dark" | "system";
 
@@ -66,11 +73,9 @@ export default function App() {
   const [ownText, setOwnText] = useState("");
   const [path, setPath] = useState("");
   const [ownFiles, setOwnFiles] = useState<string[] | null>(null);
-  const [log, setLog] = useState<string[]>([]);
   const [status, setStatus] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [applyLog, setApplyLog] = useState<string[]>([]);
-  const [applying, setApplying] = useState(false);
+  const [running, setRunning] = useState<Partial<Record<Cmd, boolean>>>({});
+  const [logs, setLogs] = useState<Partial<Record<Cmd, string[]>>>({});
 
   useEffect(() => {
     invoke<string>("config_path").then(setPath);
@@ -106,30 +111,18 @@ export default function App() {
     }
   };
 
-  const pull = async () => {
-    setBusy(true);
-    setLog([]);
+  const run = async (cmd: Cmd) => {
+    setRunning((r) => ({ ...r, [cmd]: true }));
+    setLogs((l) => ({ ...l, [cmd]: [] }));
+    let out: string[];
     try {
       await invoke("save_config", { cfg: current() });
-      setLog(await invoke<string[]>("run_pull"));
+      out = await invoke<string[]>(cmd);
     } catch (e) {
-      setLog([String(e)]);
-    } finally {
-      setBusy(false);
+      out = [String(e)];
     }
-  };
-
-  const apply = async () => {
-    setApplying(true);
-    setApplyLog([]);
-    try {
-      await invoke("save_config", { cfg: current() });
-      setApplyLog(await invoke<string[]>("apply_bondriver"));
-    } catch (e) {
-      setApplyLog([String(e)]);
-    } finally {
-      setApplying(false);
-    }
+    setLogs((l) => ({ ...l, [cmd]: out }));
+    setRunning((r) => ({ ...r, [cmd]: false }));
   };
 
   return (
@@ -162,6 +155,7 @@ export default function App() {
           </div>
           <Field id="bondriver_dir" label="BonDriver フォルダー" value={cfg.bondriver_dir} onChange={(v) => set({ bondriver_dir: v })} />
           <Field id="cloudflared" label="cloudflared のパス" value={cfg.cloudflared} onChange={(v) => set({ cloudflared: v })} />
+          <Field id="edcb_ini" label="EpgTimerSrv.ini のパス" value={cfg.edcb_ini} placeholder="空欄なら自動で探します" onChange={(v) => set({ edcb_ini: v })} />
         </CardContent>
       </Card>
 
@@ -205,15 +199,16 @@ export default function App() {
                   <Trash2 />
                 </Button>
               </div>
-              <div className="grid grid-cols-[2fr_1fr_1fr_1fr] gap-2">
+              <div className="grid grid-cols-[2fr_1fr_1fr_1fr_1fr] gap-2">
                 <Input value={p.bdp_url} placeholder="チューナー: https://example.com/bdp" onChange={(e) => setPeer(i, { bdp_url: e.target.value })} />
                 <Input type="number" value={p.bdp_port || ""} placeholder="ポート" onChange={(e) => setPeer(i, { bdp_port: Number(e.target.value) || 0 })} />
                 <Input value={p.bdp_group} placeholder="グループ名" onChange={(e) => setPeer(i, { bdp_group: e.target.value })} />
                 <Input value={p.bdp_name} placeholder="名前 (Z390)" onChange={(e) => setPeer(i, { bdp_name: e.target.value })} />
+                <Input type="number" value={p.bdp_count || ""} placeholder="チューナー数" onChange={(e) => setPeer(i, { bdp_count: Number(e.target.value) || 0 })} />
               </div>
             </div>
           ))}
-          <Button variant="outline" size="sm" className="w-fit" onClick={() => set({ peers: [...cfg.peers, { url: "", token_file: "", bdp_url: "", bdp_port: 0, bdp_group: "", bdp_name: "" }] })}>
+          <Button variant="outline" size="sm" className="w-fit" onClick={() => set({ peers: [...cfg.peers, { url: "", token_file: "", bdp_url: "", bdp_port: 0, bdp_group: "", bdp_name: "", bdp_count: 0 }] })}>
             <Plus />
             取得先を追加
           </Button>
@@ -226,11 +221,11 @@ export default function App() {
           <CardDescription>チューナー欄がある取得先ごとに BonDriver_Proxy_名前 を作り、cloudflared の中継を常駐登録します (管理者権限)。</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-3">
-          <Button className="w-fit" disabled={applying} onClick={apply}>
+          <Button className="w-fit" disabled={running.apply_bondriver} onClick={() => run("apply_bondriver")}>
             <Cable />
-            {applying ? "適用中…" : "BonDriver を適用"}
+            {running.apply_bondriver ? "適用中…" : "BonDriver を適用"}
           </Button>
-          {applyLog.length > 0 && <pre className="rounded-md bg-muted p-3 text-xs whitespace-pre-wrap">{applyLog.join("\n")}</pre>}
+          <LogView lines={logs.apply_bondriver} />
         </CardContent>
       </Card>
 
@@ -240,11 +235,11 @@ export default function App() {
           <CardDescription>設定を保存してから pull を 1 回実行します。</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-3">
-          <Button className="w-fit" disabled={busy} onClick={pull}>
+          <Button className="w-fit" disabled={running.run_pull} onClick={() => run("run_pull")}>
             <Download />
-            {busy ? "取得中…" : "pull を実行"}
+            {running.run_pull ? "取得中…" : "pull を実行"}
           </Button>
-          {log.length > 0 && <pre className="rounded-md bg-muted p-3 text-xs whitespace-pre-wrap">{log.join("\n")}</pre>}
+          <LogView lines={logs.run_pull} />
         </CardContent>
       </Card>
     </main>
